@@ -463,7 +463,8 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE previousInstance
     options.launchViaSteam = autoLaunchSteam;
     options.infiniteWait = true;
     options.residentGuardian = commandLine.daemon;
-    options.targetPollMs = commandLine.daemon ? 200U : 100U;
+    options.retrySteamRestartStub = true;
+    options.targetPollMs = 50U;
     return civ6fix::RunAppWindow(
         instance, commandLine.daemon ? SW_HIDE : showCommand, logger, options);
 }

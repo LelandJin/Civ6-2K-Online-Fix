@@ -749,7 +749,14 @@ struct Win32FixPlatform::Impl {
                                                    SYNCHRONIZE,
                                                FALSE, entry.th32ProcessID));
             if (!candidate.Valid()) {
-                return {TargetScanOutcome::Failed, {}, GetLastError()};
+                const DWORD err = GetLastError();
+                if (err == ERROR_INVALID_PARAMETER) {
+                    continue;
+                }
+                return {TargetScanOutcome::Failed, {}, err};
+            }
+            if (WaitForSingleObject(candidate.Get(), 0) == WAIT_OBJECT_0) {
+                continue;
             }
             std::vector<wchar_t> pathBuffer(32768);
             DWORD length = static_cast<DWORD>(pathBuffer.size());
@@ -915,6 +922,12 @@ bool Win32FixPlatform::LaunchViaSteam(std::wstring& detail) {
 }
 
 TargetScanResult Win32FixPlatform::ScanForTarget() {
+    impl_->process.Reset();
+    impl_->targetPid = 0;
+    impl_->moduleBase = 0;
+    impl_->validatedIat = 0;
+    impl_->validatedOriginal = 0;
+    impl_->activeProfile = nullptr;
     return impl_->Scan(false);
 }
 
@@ -1846,6 +1859,49 @@ bool SetAutoStartDaemonEnabled(bool enable, Logger& logger) {
         return false;
     }
     logger.Event("autostart_daemon_updated", "\"enabled\":true");
+    return true;
+}
+
+namespace {
+
+std::filesystem::path SettingsIniPath() {
+    std::vector<wchar_t> executable(32768);
+    const DWORD length = GetModuleFileNameW(
+        nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+    if (length == 0 || length >= executable.size()) {
+        return {};
+    }
+    std::filesystem::path settings(
+        std::wstring(executable.data(), static_cast<std::size_t>(length)));
+    settings.replace_extension(L".ini");
+    return settings;
+}
+
+}  // namespace
+
+bool ReadContinuousGuardianPreference(bool defaultValue) {
+    const std::filesystem::path ini = SettingsIniPath();
+    if (ini.empty()) {
+        return defaultValue;
+    }
+    return GetPrivateProfileIntW(L"guardian", L"continuous",
+                                 defaultValue ? 1 : 0, ini.c_str()) != 0;
+}
+
+bool WriteContinuousGuardianPreference(bool enabled, Logger& logger) {
+    const std::filesystem::path ini = SettingsIniPath();
+    if (ini.empty()) {
+        logger.Event("continuous_guardian_preference_failed", "\"win32\":0");
+        return false;
+    }
+    if (!WritePrivateProfileStringW(L"guardian", L"continuous",
+                                    enabled ? L"1" : L"0", ini.c_str())) {
+        logger.Event("continuous_guardian_preference_failed",
+                     "\"win32\":" + std::to_string(GetLastError()));
+        return false;
+    }
+    logger.Event("continuous_guardian_preference_updated",
+                 enabled ? "\"enabled\":true" : "\"enabled\":false");
     return true;
 }
 

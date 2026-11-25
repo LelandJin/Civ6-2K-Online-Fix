@@ -391,7 +391,7 @@ SessionPresentation PresentPlayerStatus(const SessionStatus& s) {
     }
     switch(s.result) {
     case SessionResult::Fixed: case SessionResult::OnlineWithoutIntervention:
-        p.headline=L"2K 已就绪（自动守护中）";p.detail=L"退出游戏后将自动重新进入监听；开启常驻守护时关闭窗口会转入后台继续守护。";break;
+        p.headline=L"2K 已就绪";p.detail=L"本局保护已生效。勾选下方「持续守护」可在退出游戏后自动重新监听，关窗将隐藏到系统托盘。";break;
     case SessionResult::MonitorTimedOutHookKept:
         p.headline=L"未能确认 2K 状态";p.detail=L"请查看游戏内的在线状态。如需反馈，请点“反馈问题”。";break;
     case SessionResult::CancelledOwnershipUnreadable: case SessionResult::CancelledRestoreUnconfirmed:

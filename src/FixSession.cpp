@@ -141,187 +141,257 @@ SessionResult FixSession::Run() {
                       std::move(steamLaunchFailureDetail));
     }
 
-    Publish(SessionPhase::WaitingForGame);
+    std::uint32_t ignoredExitedPid = 0;
+    const auto resetForStubRetry = [&](std::uint32_t exitedPid) {
+        ignoredExitedPid = exitedPid;
+        diagnostics_.validationAttempted = false;
+        diagnostics_.validationOutcome = 0;
+        diagnostics_.validationError = 0;
+        diagnostics_.installAttempted = false;
+        diagnostics_.installOutcome = 0;
+        diagnostics_.installError = 0;
+        diagnostics_.guardInstalled = false;
+        diagnostics_.finalOwnership.reset();
+        diagnostics_.processAgeAtGuardMs.reset();
+        diagnostics_.mutexProbe = VectorProbeState::NotAttempted;
+        diagnostics_.mutexCountBeforeGuard.reset();
+        diagnostics_.monitorElapsedMs = 0;
+        diagnostics_.samples = 0;
+        diagnostics_.completeSamples = 0;
+        diagnostics_.maxSampleGapMs = 0;
+        diagnostics_.lastSampleAtMs = 0;
+        diagnostics_.firstInterceptionAtMs.reset();
+        diagnostics_.latest = {};
+        diagnostics_.counter = {};
+        diagnostics_.discovery = {};
+        diagnostics_.sso = {};
+        diagnostics_.lastGoodCounter = 0;
+        diagnostics_.lastGoodDiscovery = -1;
+        diagnostics_.lastGoodSso = -1;
+        monitorStartedMs_.reset();
+        feedbackEvents_.clear();
+        omittedTail_ = 0;
+    };
+
     const std::uint64_t waitStarted = platform_.MonotonicMilliseconds();
-    TargetProcess target;
     for (;;) {
-        if (cancelledBeforeWrite()) {
-            return Finish(SessionResult::CancelledBeforeWrite);
-        }
-        if (!launchSteamIfRequested()) {
-            return Finish(SessionResult::SteamLaunchFailedNoWrite, nullptr,
-                          nullptr, std::move(steamLaunchFailureDetail));
-        }
-        const TargetScanResult scan = platform_.ScanForTarget();
-        if (scan.outcome == TargetScanOutcome::Failed) {
-            diagnostics_.scanError = scan.win32Error;
-            return Finish(SessionResult::ProcessScanFailedNoWrite, nullptr, nullptr,
-                          L"target process scan failed");
-        }
-        if (scan.outcome == TargetScanOutcome::Found) {
-            target = scan.target;
-            break;
-        }
-        const std::uint64_t now = platform_.MonotonicMilliseconds();
-        if (!options_.infiniteWait &&
-            now - waitStarted >= options_.targetWaitTimeoutMs) {
-            return Finish(SessionResult::TargetWaitTimedOutNoWrite);
-        }
-        platform_.SleepFor(options_.targetPollMs);
-    }
-
-    if (target.profile == nullptr) {
-        return Finish(SessionResult::UnsupportedBuildNoWrite, &target);
-    }
-    const BuildUseDecision buildUse = DecideBuildUse(target.profile);
-    if (buildUse == BuildUseDecision::RejectUnknownNoWrite) {
-        return Finish(SessionResult::UnsupportedBuildNoWrite, &target);
-    }
-
-    Publish(SessionPhase::ValidatingRuntime, SessionResult::None, &target);
-    const RuntimeValidationResult validation =
-        platform_.ValidateRuntime(target, *target.profile);
-    diagnostics_.validationAttempted = true;
-    diagnostics_.validationOutcome = static_cast<int>(validation.outcome);
-    diagnostics_.validationError = validation.win32Error;
-    diagnostics_.mutexProbe = validation.mutexProbe;
-    diagnostics_.mutexCountBeforeGuard = validation.mutexCount;
-    if (validation.outcome != RuntimeValidationOutcome::Valid) {
-        return Finish(SessionResult::RuntimeMismatchNoWrite, &target, nullptr,
-                      validation.detail);
-    }
-
-    if (buildUse == BuildUseDecision::ObserveCandidateReadOnly) {
-        return Finish(SessionResult::CandidateDetectedReadOnly, &target);
-    }
-    if (buildUse != BuildUseDecision::InstallVerifiedGuard) {
-        return Finish(SessionResult::UnsupportedBuildNoWrite, &target);
-    }
-    if (cancelledBeforeWrite()) {
-        return Finish(SessionResult::CancelledBeforeWrite, &target);
-    }
-
-    Publish(SessionPhase::InstallingGuard, SessionResult::None, &target);
-    if (cancelledBeforeWrite()) {
-        return Finish(SessionResult::CancelledBeforeWrite, &target);
-    }
-    const GuardInstallResult installation =
-        platform_.InstallGuard(target, *target.profile);
-    diagnostics_.installAttempted = true;
-    diagnostics_.installOutcome = static_cast<int>(installation.outcome);
-    diagnostics_.installError = installation.win32Error;
-    if (installation.outcome != GuardInstallOutcome::Installed) {
-        SessionResult failure = SessionResult::GuardInstallFailed;
-        if (installation.outcome ==
-            GuardInstallOutcome::FailedNoHookProtectionUncertain) {
-            failure = SessionResult::
-                GuardInstallFailedNoHookProtectionUncertain;
-        } else if (installation.outcome ==
-            GuardInstallOutcome::FailedRestoredAllocationRetained) {
-            failure =
-                SessionResult::GuardInstallFailedRestoredAllocationRetained;
-        } else if (installation.outcome == GuardInstallOutcome::
-                                               FailedRestoredProtectionUncertainAllocationRetained) {
-            failure = SessionResult::
-                GuardInstallFailedRestoredProtectionUncertainAllocationRetained;
-        } else if (
-            installation.outcome ==
-                GuardInstallOutcome::FailedStateUncertainAllocationRetained) {
-            failure = SessionResult::
-                GuardInstallFailedStateUncertainAllocationRetained;
-        }
-        return Finish(failure, &target, nullptr, installation.detail);
-    }
-
-    diagnostics_.guardInstalled = true;
-    installedForReport_=installation.guard;
-    diagnostics_.processAgeAtGuardMs = platform_.ProcessAgeMilliseconds(target);
-    const std::uint64_t monitorStarted = platform_.MonotonicMilliseconds();
-    monitorStartedMs_ = monitorStarted;
-    Publish(SessionPhase::Monitoring, SessionResult::None, &target);
-    std::uint64_t lastPublishedMs = 0;
-    MonitorSample current;
-    for (;;) {
-        diagnostics_.monitorElapsedMs = platform_.MonotonicMilliseconds() - monitorStarted;
-        if (StopRequested()) {
-            const HookCleanupOutcome cleanup =
-                platform_.RestoreOwnedHook(target, installation.guard);
-            if (cleanup == HookCleanupOutcome::TargetExited) {
-                return Finish(SessionResult::TargetExited, &target, &current);
+        Publish(SessionPhase::WaitingForGame);
+        TargetProcess target;
+        for (;;) {
+            if (cancelledBeforeWrite()) {
+                return Finish(SessionResult::CancelledBeforeWrite);
             }
-            if (cleanup == HookCleanupOutcome::
-                               RestorePointerVerifiedProtectionUncertainRetainAllocation) {
+            if (!launchSteamIfRequested()) {
+                return Finish(SessionResult::SteamLaunchFailedNoWrite, nullptr,
+                              nullptr, std::move(steamLaunchFailureDetail));
+            }
+            const TargetScanResult scan = platform_.ScanForTarget();
+            if (scan.outcome == TargetScanOutcome::Failed) {
+                diagnostics_.scanError = scan.win32Error;
+                return Finish(SessionResult::ProcessScanFailedNoWrite, nullptr, nullptr,
+                              L"target process scan failed");
+            }
+            if (scan.outcome == TargetScanOutcome::Found) {
+                if (scan.target.pid != 0 && scan.target.pid == ignoredExitedPid) {
+                    platform_.SleepFor(options_.targetPollMs);
+                    continue;
+                }
+                target = scan.target;
+                break;
+            }
+            const std::uint64_t now = platform_.MonotonicMilliseconds();
+            if (!options_.infiniteWait &&
+                now - waitStarted >= options_.targetWaitTimeoutMs) {
+                return Finish(SessionResult::TargetWaitTimedOutNoWrite);
+            }
+            platform_.SleepFor(options_.targetPollMs);
+        }
+
+        if (target.profile == nullptr) {
+            return Finish(SessionResult::UnsupportedBuildNoWrite, &target);
+        }
+        const BuildUseDecision buildUse = DecideBuildUse(target.profile);
+        if (buildUse == BuildUseDecision::RejectUnknownNoWrite) {
+            return Finish(SessionResult::UnsupportedBuildNoWrite, &target);
+        }
+
+        Publish(SessionPhase::ValidatingRuntime, SessionResult::None, &target);
+        const RuntimeValidationResult validation =
+            platform_.ValidateRuntime(target, *target.profile);
+        diagnostics_.validationAttempted = true;
+        diagnostics_.validationOutcome = static_cast<int>(validation.outcome);
+        diagnostics_.validationError = validation.win32Error;
+        diagnostics_.mutexProbe = validation.mutexProbe;
+        diagnostics_.mutexCountBeforeGuard = validation.mutexCount;
+        if (validation.outcome != RuntimeValidationOutcome::Valid) {
+            const bool stubExited =
+                validation.outcome == RuntimeValidationOutcome::ProcessExited ||
+                (validation.outcome == RuntimeValidationOutcome::ReadFailed &&
+                 platform_.QueryTargetState(target) == TargetRunState::Exited);
+            if (options_.retrySteamRestartStub && stubExited) {
+                resetForStubRetry(target.pid);
+                platform_.SleepFor(options_.targetPollMs);
+                continue;
+            }
+            return Finish(SessionResult::RuntimeMismatchNoWrite, &target, nullptr,
+                          validation.detail);
+        }
+
+        if (buildUse == BuildUseDecision::ObserveCandidateReadOnly) {
+            return Finish(SessionResult::CandidateDetectedReadOnly, &target);
+        }
+        if (buildUse != BuildUseDecision::InstallVerifiedGuard) {
+            return Finish(SessionResult::UnsupportedBuildNoWrite, &target);
+        }
+        if (cancelledBeforeWrite()) {
+            return Finish(SessionResult::CancelledBeforeWrite, &target);
+        }
+
+        Publish(SessionPhase::InstallingGuard, SessionResult::None, &target);
+        if (cancelledBeforeWrite()) {
+            return Finish(SessionResult::CancelledBeforeWrite, &target);
+        }
+        const GuardInstallResult installation =
+            platform_.InstallGuard(target, *target.profile);
+        diagnostics_.installAttempted = true;
+        diagnostics_.installOutcome = static_cast<int>(installation.outcome);
+        diagnostics_.installError = installation.win32Error;
+        if (installation.outcome != GuardInstallOutcome::Installed) {
+            if (options_.retrySteamRestartStub &&
+                installation.outcome == GuardInstallOutcome::FailedNoHook &&
+                platform_.QueryTargetState(target) == TargetRunState::Exited) {
+                resetForStubRetry(target.pid);
+                platform_.SleepFor(options_.targetPollMs);
+                continue;
+            }
+            SessionResult failure = SessionResult::GuardInstallFailed;
+            if (installation.outcome ==
+                GuardInstallOutcome::FailedNoHookProtectionUncertain) {
+                failure = SessionResult::
+                    GuardInstallFailedNoHookProtectionUncertain;
+            } else if (installation.outcome ==
+                GuardInstallOutcome::FailedRestoredAllocationRetained) {
+                failure =
+                    SessionResult::GuardInstallFailedRestoredAllocationRetained;
+            } else if (installation.outcome == GuardInstallOutcome::
+                                                   FailedRestoredProtectionUncertainAllocationRetained) {
+                failure = SessionResult::
+                    GuardInstallFailedRestoredProtectionUncertainAllocationRetained;
+            } else if (
+                installation.outcome ==
+                    GuardInstallOutcome::FailedStateUncertainAllocationRetained) {
+                failure = SessionResult::
+                    GuardInstallFailedStateUncertainAllocationRetained;
+            }
+            return Finish(failure, &target, nullptr, installation.detail);
+        }
+
+        diagnostics_.guardInstalled = true;
+        installedForReport_=installation.guard;
+        diagnostics_.processAgeAtGuardMs = platform_.ProcessAgeMilliseconds(target);
+        const std::uint64_t monitorStarted = platform_.MonotonicMilliseconds();
+        monitorStartedMs_ = monitorStarted;
+        Publish(SessionPhase::Monitoring, SessionResult::None, &target);
+        std::uint64_t lastPublishedMs = 0;
+        MonitorSample current;
+        bool retryAfterStubExit = false;
+        for (;;) {
+            diagnostics_.monitorElapsedMs = platform_.MonotonicMilliseconds() - monitorStarted;
+            if (StopRequested()) {
+                const HookCleanupOutcome cleanup =
+                    platform_.RestoreOwnedHook(target, installation.guard);
+                if (cleanup == HookCleanupOutcome::TargetExited) {
+                    return Finish(SessionResult::TargetExited, &target, &current);
+                }
+                if (cleanup == HookCleanupOutcome::
+                                   RestorePointerVerifiedProtectionUncertainRetainAllocation) {
+                    return Finish(
+                        SessionResult::
+                            CancelledOwnedHookRestoredProtectionUncertainAllocationRetained,
+                        &target, &current);
+                }
+                const bool restored =
+                    cleanup == HookCleanupOutcome::RestoreOwnedAndRetainAllocation ||
+                    cleanup == HookCleanupOutcome::AlreadyOriginalAndRetainAllocation;
+                if (cleanup == HookCleanupOutcome::UnreadableNoWrite)
+                    return Finish(SessionResult::CancelledOwnershipUnreadable, &target, &current);
+                if (cleanup == HookCleanupOutcome::RestoreAttemptUnconfirmed)
+                    return Finish(SessionResult::CancelledRestoreUnconfirmed, &target, &current);
                 return Finish(
-                    SessionResult::
-                        CancelledOwnedHookRestoredProtectionUncertainAllocationRetained,
+                    restored
+                        ? SessionResult::CancelledOwnedHookRestoredAllocationRetained
+                        : SessionResult::CancelledHookNotOwnedNoWrite,
                     &target, &current);
             }
-            const bool restored =
-                cleanup == HookCleanupOutcome::RestoreOwnedAndRetainAllocation ||
-                cleanup == HookCleanupOutcome::AlreadyOriginalAndRetainAllocation;
-            if (cleanup == HookCleanupOutcome::UnreadableNoWrite)
-                return Finish(SessionResult::CancelledOwnershipUnreadable, &target, &current);
-            if (cleanup == HookCleanupOutcome::RestoreAttemptUnconfirmed)
-                return Finish(SessionResult::CancelledRestoreUnconfirmed, &target, &current);
-            return Finish(
-                restored
-                    ? SessionResult::CancelledOwnedHookRestoredAllocationRetained
-                    : SessionResult::CancelledHookNotOwnedNoWrite,
-                &target, &current);
-        }
 
-        const TargetRunState runState = platform_.QueryTargetState(target);
-        if (runState == TargetRunState::Exited) {
-            return Finish(SessionResult::TargetExited, &target, &current);
-        }
-        if (runState == TargetRunState::WaitFailed) {
-            return Finish(SessionResult::TargetWaitFailedHookKept, &target, &current);
-        }
+            const TargetRunState runState = platform_.QueryTargetState(target);
+            if (runState == TargetRunState::Exited) {
+                const bool stubExitBeforeInit =
+                    options_.retrySteamRestartStub &&
+                    diagnostics_.monitorElapsedMs < 5000 &&
+                    current.skippedInvalidUnlocks == 0 &&
+                    !(CompleteSample(current) && current.discoveryState == 4 &&
+                      current.ssoState == 4);
+                if (stubExitBeforeInit) {
+                    retryAfterStubExit = true;
+                    break;
+                }
+                return Finish(SessionResult::TargetExited, &target, &current);
+            }
+            if (runState == TargetRunState::WaitFailed) {
+                return Finish(SessionResult::TargetWaitFailedHookKept, &target, &current);
+            }
 
-        const MonitorSample sample =
-            platform_.ReadMonitorSample(target, installation.guard);
-        current = sample;
-        const auto sampledAtMs = platform_.MonotonicMilliseconds() - monitorStarted;
-        const bool changed = diagnostics_.Record(sample, sampledAtMs);
-        if (changed) {
-            // Above all possible polls in the normal 90 s / 10 ms session.
-            if (feedbackEvents_.size() < 16384) feedbackEvents_.push_back({sampledAtMs, sample});
-            else ++omittedTail_;
-        }
-        const bool ready = CompleteSample(sample) && sample.discoveryState == 4 && sample.ssoState == 4;
-        // Bound UI/log volume, but never suppress the first or ready observation.
-        if (diagnostics_.samples == 1 || ready ||
-            (changed && sampledAtMs - lastPublishedMs >= 250) ||
-            sampledAtMs - lastPublishedMs >= 1000) {
-            Publish(SessionPhase::Monitoring, SessionResult::None, &target, &current);
-            lastPublishedMs = sampledAtMs;
-        }
+            const MonitorSample sample =
+                platform_.ReadMonitorSample(target, installation.guard);
+            current = sample;
+            const auto sampledAtMs = platform_.MonotonicMilliseconds() - monitorStarted;
+            const bool changed = diagnostics_.Record(sample, sampledAtMs);
+            if (changed) {
+                // Above all possible polls in the normal 90 s / 10 ms session.
+                if (feedbackEvents_.size() < 16384) feedbackEvents_.push_back({sampledAtMs, sample});
+                else ++omittedTail_;
+            }
+            const bool ready = CompleteSample(sample) && sample.discoveryState == 4 && sample.ssoState == 4;
+            // Bound UI/log volume, but never suppress the first or ready observation.
+            if (diagnostics_.samples == 1 || ready ||
+                (changed && sampledAtMs - lastPublishedMs >= 250) ||
+                sampledAtMs - lastPublishedMs >= 1000) {
+                Publish(SessionPhase::Monitoring, SessionResult::None, &target, &current);
+                lastPublishedMs = sampledAtMs;
+            }
 
-        const std::uint64_t now = platform_.MonotonicMilliseconds();
-        diagnostics_.monitorElapsedMs = now - monitorStarted;
-        // An observer or the UI may cancel during the sample read/publication.
-        // Return to the owned-hook cleanup path before selecting a terminal result.
-        if (StopRequested()) {
+            const std::uint64_t now = platform_.MonotonicMilliseconds();
+            diagnostics_.monitorElapsedMs = now - monitorStarted;
+            // An observer or the UI may cancel during the sample read/publication.
+            // Return to the owned-hook cleanup path before selecting a terminal result.
+            if (StopRequested()) {
+                continue;
+            }
+            const MonitorDecision decision = DecideMonitoring({
+                current.skippedInvalidUnlocks,
+                CompleteSample(current) ? current.discoveryState : -1,
+                CompleteSample(current) ? current.ssoState : -1,
+                now - monitorStarted >= options_.monitorTimeoutMs,
+                false,
+            });
+            if (decision == MonitorDecision::DetachAndKeepHook) {
+                return Finish(SessionResult::Fixed, &target, &current);
+            }
+            if (decision == MonitorDecision::DetachOnlineWithoutIntervention) {
+                return Finish(SessionResult::OnlineWithoutIntervention, &target,
+                              &current);
+            }
+            if (decision == MonitorDecision::DetachTimedOutAndKeepHook) {
+                return Finish(SessionResult::MonitorTimedOutHookKept, &target, &current);
+            }
+            platform_.SleepFor(options_.monitorPollMs);
+        }
+        if (retryAfterStubExit) {
+            resetForStubRetry(target.pid);
+            platform_.SleepFor(options_.targetPollMs);
             continue;
         }
-        const MonitorDecision decision = DecideMonitoring({
-            current.skippedInvalidUnlocks,
-            CompleteSample(current) ? current.discoveryState : -1,
-            CompleteSample(current) ? current.ssoState : -1,
-            now - monitorStarted >= options_.monitorTimeoutMs,
-            false,
-        });
-        if (decision == MonitorDecision::DetachAndKeepHook) {
-            return Finish(SessionResult::Fixed, &target, &current);
-        }
-        if (decision == MonitorDecision::DetachOnlineWithoutIntervention) {
-            return Finish(SessionResult::OnlineWithoutIntervention, &target,
-                          &current);
-        }
-        if (decision == MonitorDecision::DetachTimedOutAndKeepHook) {
-            return Finish(SessionResult::MonitorTimedOutHookKept, &target, &current);
-        }
-        platform_.SleepFor(options_.monitorPollMs);
     }
 }
 

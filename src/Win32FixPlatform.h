@@ -46,5 +46,7 @@ bool RepairNetworkAndMods(Logger& logger, bool resetModCache,
 bool IsGameProcessRunning();
 bool IsAutoStartDaemonEnabled();
 bool SetAutoStartDaemonEnabled(bool enable, Logger& logger);
+bool ReadContinuousGuardianPreference(bool defaultValue);
+bool WriteContinuousGuardianPreference(bool enabled, Logger& logger);
 
 }  // namespace civ6fix

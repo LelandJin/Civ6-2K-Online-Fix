@@ -1347,5 +1347,66 @@ int main() {
                      "infiniteWait guardian continues waiting past targetWaitTimeoutMs and fixes late launches");
     }
 
+    {
+        using namespace civ6fix;
+        class SteamStubPlatform final : public IFixSessionPlatform {
+        public:
+            PreparationResult Prepare() override {
+                PreparationResult p;
+                p.outcome = PreparationOutcome::Ready;
+                return p;
+            }
+            bool LaunchViaSteam(std::wstring&) override { return true; }
+            TargetScanResult ScanForTarget() override {
+                ++scanCalls;
+                if (scanCalls == 1) {
+                    return {TargetScanOutcome::Found, {100, &kDx12Profile, L"stub"}, 0};
+                }
+                if (scanCalls == 2) {
+                    return {TargetScanOutcome::Found, {100, &kDx12Profile, L"stub"}, 0};
+                }
+                return {TargetScanOutcome::Found, {200, &kDx12Profile, L"real"}, 0};
+            }
+            RuntimeValidationResult ValidateRuntime(const TargetProcess&, const BuildProfile&) override {
+                ++validateCalls;
+                RuntimeValidationResult result;
+                result.outcome = RuntimeValidationOutcome::Valid;
+                result.detail = L"ok";
+                return result;
+            }
+            GuardInstallResult InstallGuard(const TargetProcess& target, const BuildProfile&) override {
+                installedPids.push_back(target.pid);
+                return {GuardInstallOutcome::Installed, {0x1000, 0x2000, 0x3000, 0x3000, 0x4000}, 0, L"ok"};
+            }
+            TargetRunState QueryTargetState(const TargetProcess& target) override {
+                return target.pid == 100 ? TargetRunState::Exited : TargetRunState::Running;
+            }
+            MonitorSample ReadMonitorSample(const TargetProcess&, const InstalledGuard&) override {
+                return {true, 1, 4, 4};
+            }
+            HookCleanupOutcome RestoreOwnedHook(const TargetProcess&, const InstalledGuard&) override {
+                return HookCleanupOutcome::TargetExited;
+            }
+            std::uint64_t MonotonicMilliseconds() override { return now_++; }
+            void SleepFor(std::uint32_t) override {}
+            int scanCalls = 0;
+            int validateCalls = 0;
+            std::vector<std::uint32_t> installedPids;
+        private:
+            std::uint64_t now_ = 0;
+        } stubPlatform;
+
+        SilentObserver observer;
+        SessionOptions opts;
+        opts.retrySteamRestartStub = true;
+        opts.targetPollMs = 1;
+        FixSession session(stubPlatform, observer, opts);
+        tests.Expect(session.Run() == SessionResult::Fixed &&
+                         stubPlatform.installedPids.size() == 2 &&
+                         stubPlatform.installedPids[0] == 100 &&
+                         stubPlatform.installedPids[1] == 200,
+                     "retrySteamRestartStub recovers from pre-init stub exit and guards the real game PID");
+    }
+
     return tests.Finish();
 }

@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cwchar>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -32,6 +33,7 @@ constexpr wchar_t kHeadingText[] = L"文明 VI · 2K 在线修复";
 constexpr UINT kSessionStatusMessage = WM_APP + 1;
 constexpr UINT kSessionCompletedMessage = WM_APP + 2;
 constexpr UINT kForceExitDaemonMessage = WM_APP + 3;
+constexpr UINT kTrayCallbackMessage = WM_APP + 4;
 
 constexpr int kStatusId = 1001;
 constexpr int kDetailId = 1002;
@@ -43,9 +45,22 @@ constexpr int kLogsId = 1103;
 constexpr int kCopyId = 1104;
 constexpr int kUpdateId = 1105;
 constexpr int kRepairNetModsId = 1106;
-constexpr int kResidentId = 1107;
+constexpr int kContinuousCheckId = 1107;
+constexpr int kAutoStartCheckId = 1108;
+constexpr int kTrayShowId = 1201;
+constexpr int kTrayExitId = 1202;
+constexpr int kTrayToggleContinuousId = 1203;
+constexpr int kTrayToggleAutoStartId = 1204;
 constexpr UINT_PTR kUpdateTimer=17;
 constexpr UINT_PTR kRearmTimer = 18;
+
+bool IsRearmEligible(SessionResult result) noexcept {
+    return result == SessionResult::Fixed ||
+           result == SessionResult::OnlineWithoutIntervention ||
+           result == SessionResult::MonitorTimedOutHookKept ||
+           result == SessionResult::TargetExited ||
+           result == SessionResult::ExistingGameNoWrite;
+}
 
 HMENU ControlId(int identifier) {
     return reinterpret_cast<HMENU>(static_cast<INT_PTR>(identifier));
@@ -166,8 +181,10 @@ class AppWindow {
 public:
     AppWindow(HINSTANCE instance, Logger& logger, SessionOptions options)
         : instance_(instance), logger_(logger), options_(options),
-          residentEnabled_(options.residentGuardian || IsAutoStartDaemonEnabled()),
-          steamLaunchRequested_(options.launchViaSteam) {}
+          steamLaunchRequested_(options.launchViaSteam),
+          autoStartEnabled_(IsAutoStartDaemonEnabled()),
+          continuousGuardian_(options.residentGuardian ? true
+                                                       : ReadContinuousGuardianPreference(true)) {}
 
     ~AppWindow() {
         RequestStop();
@@ -197,7 +214,7 @@ public:
         }
 
         const int width = 780;
-        const int height = 540;
+        const int height = 575;
         RECT desktop{};
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &desktop, 0);
         const int x = desktop.left + (desktop.right - desktop.left - width) / 2;
@@ -254,7 +271,9 @@ private:
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         switch (message) {
         case WM_CREATE:
+            taskbarCreatedMessage_ = RegisterWindowMessageW(L"TaskbarCreated");
             CreateControls();
+            AddTrayIcon();
             return 0;
         case WM_SIZE:
             LayoutControls(LOWORD(lParam), HIWORD(lParam));
@@ -268,15 +287,24 @@ private:
         case WM_GETMINMAXINFO: {
             auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
             info->ptMinTrackSize.x = 680;
-            info->ptMinTrackSize.y = 500;
+            info->ptMinTrackSize.y = 535;
             return 0;
         }
         case WM_COMMAND:
             HandleCommand(LOWORD(wParam));
             return 0;
+        case kTrayCallbackMessage: {
+            const UINT trayEvent = LOWORD(lParam);
+            if (trayEvent == WM_LBUTTONDBLCLK || trayEvent == WM_LBUTTONUP) {
+                ShowMainWindow();
+            } else if (trayEvent == WM_RBUTTONUP || trayEvent == WM_CONTEXTMENU) {
+                ShowTrayMenu();
+            }
+            return 0;
+        }
         case WM_CLOSE:
             if(updates_.Applying()) return 0;
-            if (residentEnabled_ && !forceExitRequested_) {
+            if (continuousGuardian_ && !forceExitRequested_) {
                 ShowWindow(window_, SW_HIDE);
                 logger_.Event("window_hidden_to_background");
                 return 0;
@@ -334,22 +362,19 @@ private:
                 DestroyWindow(window_);
                 return 0;
             }
-            if (!forceExitRequested_ && !updates_.Applying()) {
-                const bool rearmEligible =
-                    latestStatus_.result == SessionResult::Fixed ||
-                    latestStatus_.result == SessionResult::OnlineWithoutIntervention ||
-                    latestStatus_.result == SessionResult::MonitorTimedOutHookKept ||
-                    latestStatus_.result == SessionResult::TargetExited ||
-                    latestStatus_.result == SessionResult::ExistingGameNoWrite;
-                if (rearmEligible) {
-                    SetTimer(window_, kRearmTimer, 1000, nullptr);
-                    logger_.Event("guardian_rearm_armed");
-                }
+            if (!forceExitRequested_ && !updates_.Applying() &&
+                continuousGuardian_ && IsRearmEligible(latestStatus_.result)) {
+                SetTimer(window_, kRearmTimer, 1000, nullptr);
+                logger_.Event("guardian_rearm_armed");
             }
             return 0;
         case WM_TIMER:
             if(wParam==kUpdateTimer){PollUpdate();return 0;}
             if (wParam == kRearmTimer) {
+                if (!continuousGuardian_) {
+                    KillTimer(window_, kRearmTimer);
+                    return 0;
+                }
                 if (workerRunning_ || closingRequested_ || forceExitRequested_ ||
                     updateReady_ || updates_.Applying()) {
                     return 0;
@@ -364,9 +389,15 @@ private:
             }
             return DefWindowProcW(window_,message,wParam,lParam);
         case WM_DESTROY:
+            RemoveTrayIcon();
             PostQuitMessage(0);
             return 0;
         default:
+            if (taskbarCreatedMessage_ != 0 && message == taskbarCreatedMessage_) {
+                trayIconAdded_ = false;
+                AddTrayIcon();
+                return 0;
+            }
             return DefWindowProcW(window_, message, wParam, lParam);
         }
     }
@@ -433,11 +464,16 @@ private:
                                             BS_PUSHBUTTON,
             0, 0, 0, 0, window_, ControlId(kCopyId), instance_,
             nullptr);
-        residentButton_ = CreateWindowExW(
+        continuousCheck_ = CreateWindowExW(
             0, L"BUTTON",
-            residentEnabled_ ? L"常驻守护: 开" : L"常驻守护: 关",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 0, 0,
-            window_, ControlId(kResidentId), instance_, nullptr);
+            L"持续守护（游戏退出后自动重监听，关窗转后台托盘）",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 0, 0, 0, 0,
+            window_, ControlId(kContinuousCheckId), instance_, nullptr);
+        autoStartCheck_ = CreateWindowExW(
+            0, L"BUTTON",
+            L"开机自启（登录 Windows 自动后台守护）",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 0, 0, 0, 0,
+            window_, ControlId(kAutoStartCheckId), instance_, nullptr);
         repairButton_ = CreateWindowExW(
             0, L"BUTTON", L"网络/模组修复",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 0, 0,
@@ -448,10 +484,15 @@ private:
         SendMessageW(title_, WM_SETFONT, reinterpret_cast<WPARAM>(titleFont_), TRUE);
         SendMessageW(status_, WM_SETFONT, reinterpret_cast<WPARAM>(statusFont_), TRUE);
         for (HWND control : {detail_, profile_, safety_, primaryButton_, secondaryButton_,
-                             logsButton_, copyButton_, residentButton_, repairButton_, updateButton_}) {
+                             logsButton_, copyButton_, continuousCheck_, autoStartCheck_,
+                             repairButton_, updateButton_}) {
             SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_),
                          TRUE);
         }
+        SendMessageW(continuousCheck_, BM_SETCHECK,
+                     continuousGuardian_ ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageW(autoStartCheck_, BM_SETCHECK,
+                     autoStartEnabled_ ? BST_CHECKED : BST_UNCHECKED, 0);
         EnableWindow(secondaryButton_, FALSE);
         SendMessageW(progress_, PBM_SETMARQUEE, TRUE, 35);
     }
@@ -459,21 +500,22 @@ private:
     void LayoutControls(int width, int height) {
         const int margin = 34;
         const int contentWidth = std::max(100, width - margin * 2);
-        MoveWindow(title_, margin, 25, std::max(10,contentWidth-368), 42, TRUE);
-        MoveWindow(residentButton_, width - margin - 96 - 8 - 124 - 8 - 124, 25, 124, 32, TRUE);
+        MoveWindow(title_, margin, 25, std::max(10, contentWidth - 236), 42, TRUE);
         MoveWindow(repairButton_, width - margin - 96 - 8 - 124, 25, 124, 32, TRUE);
-        MoveWindow(updateButton_,width-margin-96,25,96,32,TRUE);
+        MoveWindow(updateButton_, width - margin - 96, 25, 96, 32, TRUE);
         MoveWindow(status_, margin, 82, contentWidth, 34, TRUE);
-        MoveWindow(detail_, margin, 126, contentWidth, 90, TRUE);
-        MoveWindow(profile_, margin, 228, contentWidth, 28, TRUE);
-        MoveWindow(progress_, margin, 270, contentWidth, 7, TRUE);
-        MoveWindow(safety_, margin, 305, contentWidth, 56, TRUE);
+        MoveWindow(detail_, margin, 124, contentWidth, 76, TRUE);
+        MoveWindow(profile_, margin, 208, contentWidth, 26, TRUE);
+        MoveWindow(progress_, margin, 242, contentWidth, 7, TRUE);
+        MoveWindow(continuousCheck_, margin, 262, contentWidth, 28, TRUE);
+        MoveWindow(autoStartCheck_, margin, 294, contentWidth, 28, TRUE);
+        MoveWindow(safety_, margin, 334, contentWidth, 56, TRUE);
 
         const int buttonWidth = 116;
         const int primaryButtonWidth = 176;
         const int buttonHeight = 38;
         const int gap = 10;
-        const int buttonY = std::max(380, height - margin - buttonHeight - 12);
+        const int buttonY = std::max(408, height - margin - buttonHeight - 12);
         const int rightButtonsX =
             width - margin - buttonWidth * 2 - gap;
         const int secondaryX = margin + primaryButtonWidth + gap;
@@ -494,7 +536,7 @@ private:
         case kPrimaryId:
             if (primaryAction_ == SessionPrimaryAction::CloseWindow) {
                 logger_.Event("window_primary_action", "\"action\":\"close_window\"");
-                if (residentEnabled_ && !forceExitRequested_ && !updates_.Applying()) {
+                if (continuousGuardian_ && !forceExitRequested_ && !updates_.Applying()) {
                     ShowWindow(window_, SW_HIDE);
                     logger_.Event("window_hidden_to_background");
                     break;
@@ -535,22 +577,39 @@ private:
         case kUpdateId:
             BeginUpdateCheck(true);
             break;
-        case kResidentId: {
-            const bool target = !residentEnabled_;
-            if (SetAutoStartDaemonEnabled(target, logger_)) {
-                residentEnabled_ = target;
-                SetWindowTextW(residentButton_,
-                               residentEnabled_ ? L"常驻守护: 开" : L"常驻守护: 关");
-                SetWindowTextW(
-                    safety_,
-                    residentEnabled_
-                        ? L"已开启开机后台常驻守护：每次关闭游戏后自动重新监听，关窗将转入后台。"
-                        : L"已关闭开机常驻守护：点击关闭窗口将完全退出工具。");
-            } else {
-                SetWindowTextW(safety_, L"写入开机启动项失败，无法切换常驻守护状态。");
-            }
+        case kContinuousCheckId: {
+            const bool checked =
+                SendMessageW(continuousCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            SetContinuousGuardian(checked);
             break;
         }
+        case kAutoStartCheckId: {
+            const bool checked =
+                SendMessageW(autoStartCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            SetAutoStart(checked);
+            break;
+        }
+        case kTrayShowId:
+            ShowMainWindow();
+            break;
+        case kTrayToggleContinuousId:
+            SetContinuousGuardian(!continuousGuardian_);
+            break;
+        case kTrayToggleAutoStartId:
+            SetAutoStart(!autoStartEnabled_);
+            break;
+        case kTrayExitId:
+            forceExitRequested_ = true;
+            KillTimer(window_, kRearmTimer);
+            if (workerRunning_) {
+                closingRequested_ = true;
+                RequestStop();
+                SetWindowTextW(primaryButton_, L"正在安全退出…");
+                EnableWindow(primaryButton_, FALSE);
+            } else {
+                DestroyWindow(window_);
+            }
+            break;
         case kRepairNetModsId: {
             logger_.Event("window_repair_net_mods_clicked");
             EnableWindow(repairButton_, FALSE);
@@ -609,7 +668,12 @@ private:
     void ApplySessionControls(const SessionStatus& status) {
         const SessionControls controls = PresentSessionControls(status);
         primaryAction_ = controls.primaryAction;
-        SetWindowTextW(primaryButton_, controls.primaryLabel.c_str());
+        const std::wstring primaryLabel =
+            (controls.primaryAction == SessionPrimaryAction::CloseWindow &&
+             continuousGuardian_)
+                ? L"隐藏到托盘"
+                : controls.primaryLabel;
+        SetWindowTextW(primaryButton_, primaryLabel.c_str());
         EnableWindow(primaryButton_, controls.primaryEnabled ? TRUE : FALSE);
         ApplySessionLaunchControl(status);
     }
@@ -748,6 +812,141 @@ private:
         }
     }
 
+    NOTIFYICONDATAW BuildTrayNotifyData() const {
+        NOTIFYICONDATAW nid{};
+        nid.cbSize = sizeof(nid);
+        nid.hWnd = window_;
+        nid.uID = 1;
+        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        nid.uCallbackMessage = kTrayCallbackMessage;
+        nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        const wchar_t* tip = continuousGuardian_
+                                 ? (autoStartEnabled_
+                                        ? L"Civ6 2K Online Fix（持续守护：开｜开机自启：开）"
+                                        : L"Civ6 2K Online Fix（持续守护：开｜开机自启：关）")
+                                 : (autoStartEnabled_
+                                        ? L"Civ6 2K Online Fix（持续守护：关｜开机自启：开）"
+                                        : L"Civ6 2K Online Fix（持续守护：关｜开机自启：关）");
+        wcscpy_s(nid.szTip, tip);
+        return nid;
+    }
+
+    void AddTrayIcon() {
+        if (trayIconAdded_ || window_ == nullptr) {
+            return;
+        }
+        NOTIFYICONDATAW nid = BuildTrayNotifyData();
+        trayIconAdded_ = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
+    }
+
+    void UpdateTrayIcon() {
+        if (!trayIconAdded_ || window_ == nullptr) {
+            return;
+        }
+        NOTIFYICONDATAW nid = BuildTrayNotifyData();
+        Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+
+    void RemoveTrayIcon() {
+        if (!trayIconAdded_ || window_ == nullptr) {
+            return;
+        }
+        NOTIFYICONDATAW nid{};
+        nid.cbSize = sizeof(nid);
+        nid.hWnd = window_;
+        nid.uID = 1;
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+        trayIconAdded_ = false;
+    }
+
+    void ShowMainWindow() {
+        if (window_ == nullptr) {
+            return;
+        }
+        ShowWindow(window_, IsIconic(window_) ? SW_RESTORE : SW_SHOW);
+        SetForegroundWindow(window_);
+    }
+
+    void ShowTrayMenu() {
+        HMENU menu = CreatePopupMenu();
+        if (menu == nullptr) {
+            return;
+        }
+        AppendMenuW(menu, MF_STRING, kTrayShowId, L"显示主窗口");
+        AppendMenuW(menu,
+                    MF_STRING | (continuousGuardian_ ? MF_CHECKED : MF_UNCHECKED),
+                    kTrayToggleContinuousId, L"持续守护");
+        AppendMenuW(menu,
+                    MF_STRING | (autoStartEnabled_ ? MF_CHECKED : MF_UNCHECKED),
+                    kTrayToggleAutoStartId, L"开机自启");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, kTrayExitId, L"完全退出守护");
+        POINT cursor{};
+        GetCursorPos(&cursor);
+        SetForegroundWindow(window_);
+        TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN,
+                       cursor.x, cursor.y, 0, window_, nullptr);
+        PostMessageW(window_, WM_NULL, 0, 0);
+        DestroyMenu(menu);
+    }
+
+    void SetContinuousGuardian(bool enabled) {
+        continuousGuardian_ = enabled;
+        SendMessageW(continuousCheck_, BM_SETCHECK,
+                     continuousGuardian_ ? BST_CHECKED : BST_UNCHECKED, 0);
+        WriteContinuousGuardianPreference(continuousGuardian_, logger_);
+        if (!continuousGuardian_) {
+            KillTimer(window_, kRearmTimer);
+            SetWindowTextW(
+                safety_,
+                L"已关闭持续守护：本轮结束后不再自动重监听，关闭窗口将直接退出。");
+        } else {
+            if (!workerRunning_ && !forceExitRequested_ && !updates_.Applying() &&
+                latestStatus_.phase == SessionPhase::Completed &&
+                IsRearmEligible(latestStatus_.result)) {
+                SetTimer(window_, kRearmTimer, 1000, nullptr);
+                logger_.Event("guardian_rearm_armed");
+            }
+            SetWindowTextW(
+                safety_,
+                L"已开启持续守护：每次关闭游戏后将自动重新监听，关窗将隐藏到系统托盘。");
+        }
+        ApplySessionControls(latestStatus_);
+        UpdateTrayIcon();
+    }
+
+    void SetAutoStart(bool enabled) {
+        if (SetAutoStartDaemonEnabled(enabled, logger_)) {
+            autoStartEnabled_ = enabled;
+            SendMessageW(autoStartCheck_, BM_SETCHECK,
+                         autoStartEnabled_ ? BST_CHECKED : BST_UNCHECKED, 0);
+            if (autoStartEnabled_ && !continuousGuardian_) {
+                continuousGuardian_ = true;
+                SendMessageW(continuousCheck_, BM_SETCHECK, BST_CHECKED, 0);
+                WriteContinuousGuardianPreference(true, logger_);
+                if (!workerRunning_ && !forceExitRequested_ &&
+                    !updates_.Applying() &&
+                    latestStatus_.phase == SessionPhase::Completed &&
+                    IsRearmEligible(latestStatus_.result)) {
+                    SetTimer(window_, kRearmTimer, 1000, nullptr);
+                    logger_.Event("guardian_rearm_armed");
+                }
+            }
+            SetWindowTextW(
+                safety_,
+                autoStartEnabled_
+                    ? L"已开启开机自启：登录 Windows 时将在后台自动持续守护。"
+                    : L"已关闭开机自启：已移除 Windows 登录自启项。");
+        } else {
+            SendMessageW(autoStartCheck_, BM_SETCHECK,
+                         autoStartEnabled_ ? BST_CHECKED : BST_UNCHECKED, 0);
+            SetWindowTextW(safety_,
+                           L"写入开机启动项失败，无法切换开机自启状态。");
+        }
+        ApplySessionControls(latestStatus_);
+        UpdateTrayIcon();
+    }
+
     HINSTANCE instance_ = nullptr;
     Logger& logger_;
     SessionOptions options_;
@@ -762,7 +961,8 @@ private:
     HWND secondaryButton_ = nullptr;
     HWND logsButton_ = nullptr;
     HWND copyButton_ = nullptr;
-    HWND residentButton_ = nullptr;
+    HWND continuousCheck_ = nullptr;
+    HWND autoStartCheck_ = nullptr;
     HWND repairButton_ = nullptr;
     HWND updateButton_ = nullptr;
     UpdateFlow updates_;
@@ -790,7 +990,10 @@ private:
     bool workerRunning_ = false;
     bool closingRequested_ = false;
     bool forceExitRequested_ = false;
-    bool residentEnabled_ = false;
+    bool autoStartEnabled_ = false;
+    bool continuousGuardian_ = true;
+    bool trayIconAdded_ = false;
+    UINT taskbarCreatedMessage_ = 0;
 };
 
 }  // namespace

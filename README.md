@@ -13,8 +13,10 @@
 
 ## 当前版本
 
-**2.3.0** 已适配 Windows Steam 版《文明 VI》`1.0.12.74`、`1.0.12.72` 与 `1.0.12.68` 的 DX11 和 DX12，**彻底解决“第二次重开游戏 2K 又变灰”问题**：
-- **多轮次自动重武装（Auto-Rearm）与后台常驻守护**：本局修复完成或游戏退出后，守护进程会在检测到游戏完全关闭时自动重新进入监听；点击顶部 **「常驻守护: 开/关」** 可写入当前用户的开机自启（`HKCU\...\Run` -> `--daemon`），之后每次关闭工具窗口仅隐藏到后台静默守护，无论开关多少次《文明 VI》都无需手动重开工具。
+**2.3.1** 已适配 Windows Steam 版《文明 VI》`1.0.12.74`、`1.0.12.72` 与 `1.0.12.68` 的 DX11 和 DX12，**彻底解决“关闭重开游戏后 2K 再次变灰”以及直接启动 EXE 时 Steam 重启桩（`SteamAPI_RestartAppIfNecessary`）导致漏挂的问题**：
+- **GUI 双独立开关 + 系统托盘常驻控制**：
+  - 界面内提供 **「持续守护（游戏退出后自动重监听，关窗转后台托盘）」** 与 **「开机自启（登录 Windows 自动后台守护）」** 两个复选框，可随时按需自由勾选开启或取消，状态持久保存并在系统托盘右键菜单同步显示。
+  - 新增 Windows 系统托盘图标（左键还原主界面，右键可快速切换“持续守护”“开机自启”或点击“完全退出守护”）；默认勾选“持续守护”时，每次游戏退出后会在后台自动重新进入监听等待，即使从目录直接启动游戏遭遇 Steam 二次拉起也会自动重新跟进挂载真正进程。
 - 启动预检自动写入兼容游戏内置 `libCurl` 的 `NO_PROXY` 白名单（`*.2kcoretech.online`、`*.my.2k.com`、`*.firaxislive.com`、`172.16.0.0/12`），并在存在系统代理 `ProxyOverride` 时自动补齐 2K 域名直连，同时自动开启 `UserOptions.txt` 的 `AutoModDownload 1`。
 - 点击界面右上角 **「网络/模组修复」**（或使用 `--repair-net-mods` 参数）可一键清除 `hosts` 中过期的 2K/FiraxisLive 静态 AWS IP（防止节点轮换后证书错误/超时）与遗留 `/32` 路由，清理 `ZeroTier` / `UU Lanplay` / `WireGuard` 等虚拟网卡上的死链 DNS、失效 DoH 加密配置与 `fec0:0:0:ffff::1` IPv6 DNS，配置物理网卡公共 UDP DNS，并备份重置 `Mods.sqlite` 与 `Cache` 目录。
 
@@ -96,4 +98,4 @@ Civ6_2K_Online_Fix.exe --self-test          纯离线自检
 
 ## English summary
 
-Civ6 2K Online Fix is an unofficial Windows helper for a local OpenSSL `_Mtx_unlock` initialization failure and 2K/Mod network blockers in the Steam version of Civilization VI. Forked from and crediting **[yeeesy/Civ6-2K-Online-Fix](https://github.com/yeeesy/Civ6-2K-Online-Fix)** (and **TUcookie** for `1.0.12.72` profiles), version `2.3.0` supports verified DX11 and DX12 builds of `1.0.12.68`, `1.0.12.72`, and `1.0.12.74`, adds permanent multi-session auto-rearm and optional boot-time `--daemon` background guarding (fixing 2K going offline on a 2nd launch), automatically configures `libCurl`-compatible `NO_PROXY`/`ProxyOverride` bypasses and `AutoModDownload 1`, cleans stale `hosts`/DoH/virtual-adapter DNS stalls, exports shareable diagnostics, and builds cleanly under both MSVC and MinGW-w64. See [github.com/LelandJin/Civ6-2K-Online-Fix](https://github.com/LelandJin/Civ6-2K-Online-Fix).
+Civ6 2K Online Fix is an unofficial Windows helper for a local OpenSSL `_Mtx_unlock` initialization failure and 2K/Mod network blockers in the Steam version of Civilization VI. Forked from and crediting **[yeeesy/Civ6-2K-Online-Fix](https://github.com/yeeesy/Civ6-2K-Online-Fix)** (and **TUcookie** for `1.0.12.72` profiles), version `2.3.1` supports verified DX11 and DX12 builds of `1.0.12.68`, `1.0.12.72`, and `1.0.12.74`, adds permanent multi-session auto-rearm, Steam restart-stub recovery (`SteamAPI_RestartAppIfNecessary`), dedicated GUI switches for continuous guarding (`持续守护`) and boot-time autostart (`开机自启`), a Windows system tray icon/menu, automatically configures `libCurl`-compatible `NO_PROXY`/`ProxyOverride` bypasses and `AutoModDownload 1`, cleans stale `hosts`/DoH/virtual-adapter DNS stalls, exports shareable diagnostics, and builds cleanly under both MSVC and MinGW-w64. See [github.com/LelandJin/Civ6-2K-Online-Fix](https://github.com/LelandJin/Civ6-2K-Online-Fix).
