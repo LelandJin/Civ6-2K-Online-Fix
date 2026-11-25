@@ -202,6 +202,8 @@ public:
 
 struct SessionOptions {
     bool launchViaSteam = false;
+    bool infiniteWait = false;
+    bool residentGuardian = false;
     std::uint32_t targetWaitTimeoutMs = 5U * 60U * 1000U;
     std::uint32_t targetPollMs = 25;
     std::uint32_t monitorTimeoutMs = 90U * 1000U;

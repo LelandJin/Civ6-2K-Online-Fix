@@ -1775,4 +1775,78 @@ bool RepairNetworkAndMods(Logger& logger, bool resetModCache,
     return noProxyOk && cacheOk && netOptOk;
 }
 
+bool IsGameProcessRunning() {
+    return IsGameProcessRunningNow();
+}
+
+bool IsAutoStartDaemonEnabled() {
+    return ReadRegistryString(
+               HKEY_CURRENT_USER,
+               L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+               L"Civ6_2K_Online_Fix")
+        .has_value();
+}
+
+bool SetAutoStartDaemonEnabled(bool enable, Logger& logger) {
+    constexpr wchar_t kRunKey[] =
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    constexpr wchar_t kValueName[] = L"Civ6_2K_Online_Fix";
+    if (!enable) {
+        HKEY key = nullptr;
+#pragma warning(suppress : 6553)
+        const LONG openStatus =
+            RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &key);
+        if (openStatus == ERROR_FILE_NOT_FOUND) {
+            logger.Event("autostart_daemon_updated", "\"enabled\":false");
+            return true;
+        }
+        if (openStatus != ERROR_SUCCESS) {
+            logger.Event("autostart_daemon_failed",
+                         "\"win32\":" + std::to_string(openStatus));
+            return false;
+        }
+        const LONG delStatus = RegDeleteValueW(key, kValueName);
+        RegCloseKey(key);
+        const bool ok =
+            (delStatus == ERROR_SUCCESS || delStatus == ERROR_FILE_NOT_FOUND);
+        logger.Event(ok ? "autostart_daemon_updated" : "autostart_daemon_failed",
+                     ok ? std::string("\"enabled\":false")
+                        : ("\"win32\":" + std::to_string(delStatus)));
+        return ok;
+    }
+
+    std::vector<wchar_t> modulePath(32768);
+    const DWORD length = GetModuleFileNameW(
+        nullptr, modulePath.data(), static_cast<DWORD>(modulePath.size()));
+    if (length == 0 || length >= modulePath.size()) {
+        logger.Event("autostart_daemon_failed",
+                     "\"win32\":" + std::to_string(GetLastError()));
+        return false;
+    }
+    const std::wstring command =
+        L"\"" + std::wstring(modulePath.data(), length) + L"\" --daemon";
+    HKEY key = nullptr;
+    const LONG createStatus = RegCreateKeyExW(
+        HKEY_CURRENT_USER, kRunKey, 0, nullptr, REG_OPTION_NON_VOLATILE,
+        KEY_SET_VALUE, nullptr, &key, nullptr);
+    if (createStatus != ERROR_SUCCESS) {
+        logger.Event("autostart_daemon_failed",
+                     "\"win32\":" + std::to_string(createStatus));
+        return false;
+    }
+    const DWORD bytes =
+        static_cast<DWORD>((command.size() + 1U) * sizeof(wchar_t));
+    const LONG setStatus = RegSetValueExW(
+        key, kValueName, 0, REG_SZ,
+        reinterpret_cast<const BYTE*>(command.c_str()), bytes);
+    RegCloseKey(key);
+    if (setStatus != ERROR_SUCCESS) {
+        logger.Event("autostart_daemon_failed",
+                     "\"win32\":" + std::to_string(setStatus));
+        return false;
+    }
+    logger.Event("autostart_daemon_updated", "\"enabled\":true");
+    return true;
+}
+
 }  // namespace civ6fix

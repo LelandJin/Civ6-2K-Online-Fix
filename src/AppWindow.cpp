@@ -31,6 +31,7 @@ constexpr wchar_t kWindowTitle[] = L"Civ6 2K Online Fix";
 constexpr wchar_t kHeadingText[] = L"文明 VI · 2K 在线修复";
 constexpr UINT kSessionStatusMessage = WM_APP + 1;
 constexpr UINT kSessionCompletedMessage = WM_APP + 2;
+constexpr UINT kForceExitDaemonMessage = WM_APP + 3;
 
 constexpr int kStatusId = 1001;
 constexpr int kDetailId = 1002;
@@ -42,7 +43,9 @@ constexpr int kLogsId = 1103;
 constexpr int kCopyId = 1104;
 constexpr int kUpdateId = 1105;
 constexpr int kRepairNetModsId = 1106;
+constexpr int kResidentId = 1107;
 constexpr UINT_PTR kUpdateTimer=17;
+constexpr UINT_PTR kRearmTimer = 18;
 
 HMENU ControlId(int identifier) {
     return reinterpret_cast<HMENU>(static_cast<INT_PTR>(identifier));
@@ -163,6 +166,7 @@ class AppWindow {
 public:
     AppWindow(HINSTANCE instance, Logger& logger, SessionOptions options)
         : instance_(instance), logger_(logger), options_(options),
+          residentEnabled_(options.residentGuardian || IsAutoStartDaemonEnabled()),
           steamLaunchRequested_(options.launchViaSteam) {}
 
     ~AppWindow() {
@@ -272,6 +276,11 @@ private:
             return 0;
         case WM_CLOSE:
             if(updates_.Applying()) return 0;
+            if (residentEnabled_ && !forceExitRequested_) {
+                ShowWindow(window_, SW_HIDE);
+                logger_.Event("window_hidden_to_background");
+                return 0;
+            }
             if (workerRunning_) {
                 closingRequested_ = true;
                 RequestStop();
@@ -280,6 +289,16 @@ private:
                 return 0;
             }
             DestroyWindow(window_);
+            return 0;
+        case kForceExitDaemonMessage:
+            forceExitRequested_ = true;
+            KillTimer(window_, kRearmTimer);
+            if (workerRunning_) {
+                closingRequested_ = true;
+                RequestStop();
+            } else {
+                DestroyWindow(window_);
+            }
             return 0;
         case WM_CTLCOLORSTATIC: {
             HDC device = reinterpret_cast<HDC>(wParam);
@@ -313,10 +332,36 @@ private:
             if (updateReady_) {ApplyUpdateWhenIdle();return 0;}
             if (closingRequested_) {
                 DestroyWindow(window_);
+                return 0;
+            }
+            if (!forceExitRequested_ && !updates_.Applying()) {
+                const bool rearmEligible =
+                    latestStatus_.result == SessionResult::Fixed ||
+                    latestStatus_.result == SessionResult::OnlineWithoutIntervention ||
+                    latestStatus_.result == SessionResult::MonitorTimedOutHookKept ||
+                    latestStatus_.result == SessionResult::TargetExited ||
+                    latestStatus_.result == SessionResult::ExistingGameNoWrite;
+                if (rearmEligible) {
+                    SetTimer(window_, kRearmTimer, 1000, nullptr);
+                    logger_.Event("guardian_rearm_armed");
+                }
             }
             return 0;
         case WM_TIMER:
             if(wParam==kUpdateTimer){PollUpdate();return 0;}
+            if (wParam == kRearmTimer) {
+                if (workerRunning_ || closingRequested_ || forceExitRequested_ ||
+                    updateReady_ || updates_.Applying()) {
+                    return 0;
+                }
+                if (!IsGameProcessRunning()) {
+                    KillTimer(window_, kRearmTimer);
+                    options_.launchViaSteam = false;
+                    logger_.Event("guardian_rearmed_next_session");
+                    StartSession();
+                }
+                return 0;
+            }
             return DefWindowProcW(window_,message,wParam,lParam);
         case WM_DESTROY:
             PostQuitMessage(0);
@@ -388,6 +433,11 @@ private:
                                             BS_PUSHBUTTON,
             0, 0, 0, 0, window_, ControlId(kCopyId), instance_,
             nullptr);
+        residentButton_ = CreateWindowExW(
+            0, L"BUTTON",
+            residentEnabled_ ? L"常驻守护: 开" : L"常驻守护: 关",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 0, 0,
+            window_, ControlId(kResidentId), instance_, nullptr);
         repairButton_ = CreateWindowExW(
             0, L"BUTTON", L"网络/模组修复",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 0, 0,
@@ -398,7 +448,7 @@ private:
         SendMessageW(title_, WM_SETFONT, reinterpret_cast<WPARAM>(titleFont_), TRUE);
         SendMessageW(status_, WM_SETFONT, reinterpret_cast<WPARAM>(statusFont_), TRUE);
         for (HWND control : {detail_, profile_, safety_, primaryButton_, secondaryButton_,
-                             logsButton_, copyButton_, repairButton_, updateButton_}) {
+                             logsButton_, copyButton_, residentButton_, repairButton_, updateButton_}) {
             SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_),
                          TRUE);
         }
@@ -409,9 +459,10 @@ private:
     void LayoutControls(int width, int height) {
         const int margin = 34;
         const int contentWidth = std::max(100, width - margin * 2);
-        MoveWindow(title_, margin, 25, std::max(10,contentWidth-266), 42, TRUE);
-        MoveWindow(repairButton_, width - margin - 116 - 10 - 132, 25, 132, 32, TRUE);
-        MoveWindow(updateButton_,width-margin-116,25,116,32,TRUE);
+        MoveWindow(title_, margin, 25, std::max(10,contentWidth-368), 42, TRUE);
+        MoveWindow(residentButton_, width - margin - 96 - 8 - 124 - 8 - 124, 25, 124, 32, TRUE);
+        MoveWindow(repairButton_, width - margin - 96 - 8 - 124, 25, 124, 32, TRUE);
+        MoveWindow(updateButton_,width-margin-96,25,96,32,TRUE);
         MoveWindow(status_, margin, 82, contentWidth, 34, TRUE);
         MoveWindow(detail_, margin, 126, contentWidth, 90, TRUE);
         MoveWindow(profile_, margin, 228, contentWidth, 28, TRUE);
@@ -443,6 +494,11 @@ private:
         case kPrimaryId:
             if (primaryAction_ == SessionPrimaryAction::CloseWindow) {
                 logger_.Event("window_primary_action", "\"action\":\"close_window\"");
+                if (residentEnabled_ && !forceExitRequested_ && !updates_.Applying()) {
+                    ShowWindow(window_, SW_HIDE);
+                    logger_.Event("window_hidden_to_background");
+                    break;
+                }
                 if (workerRunning_) {
                     closingRequested_ = true;
                     RequestStop();
@@ -479,6 +535,22 @@ private:
         case kUpdateId:
             BeginUpdateCheck(true);
             break;
+        case kResidentId: {
+            const bool target = !residentEnabled_;
+            if (SetAutoStartDaemonEnabled(target, logger_)) {
+                residentEnabled_ = target;
+                SetWindowTextW(residentButton_,
+                               residentEnabled_ ? L"常驻守护: 开" : L"常驻守护: 关");
+                SetWindowTextW(
+                    safety_,
+                    residentEnabled_
+                        ? L"已开启开机后台常驻守护：每次关闭游戏后自动重新监听，关窗将转入后台。"
+                        : L"已关闭开机常驻守护：点击关闭窗口将完全退出工具。");
+            } else {
+                SetWindowTextW(safety_, L"写入开机启动项失败，无法切换常驻守护状态。");
+            }
+            break;
+        }
         case kRepairNetModsId: {
             logger_.Event("window_repair_net_mods_clicked");
             EnableWindow(repairButton_, FALSE);
@@ -690,6 +762,7 @@ private:
     HWND secondaryButton_ = nullptr;
     HWND logsButton_ = nullptr;
     HWND copyButton_ = nullptr;
+    HWND residentButton_ = nullptr;
     HWND repairButton_ = nullptr;
     HWND updateButton_ = nullptr;
     UpdateFlow updates_;
@@ -716,6 +789,8 @@ private:
     bool steamLaunchRequested_ = false;
     bool workerRunning_ = false;
     bool closingRequested_ = false;
+    bool forceExitRequested_ = false;
+    bool residentEnabled_ = false;
 };
 
 }  // namespace
@@ -733,6 +808,21 @@ bool ActivateExistingAppWindow() {
     SetForegroundWindow(window);
     FlashWindow(window, TRUE);
     return true;
+}
+
+bool StopExistingAppInstance() {
+    HWND window = FindWindowW(kAppWindowClassName, nullptr);
+    if (window == nullptr) {
+        return true;
+    }
+    PostMessageW(window, kForceExitDaemonMessage, 0, 0);
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        Sleep(50);
+        if (FindWindowW(kAppWindowClassName, nullptr) == nullptr) {
+            return true;
+        }
+    }
+    return false;
 }
 
 int RunAppWindow(HINSTANCE instance, int showCommand, Logger& logger,

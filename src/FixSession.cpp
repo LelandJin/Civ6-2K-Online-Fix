@@ -163,7 +163,8 @@ SessionResult FixSession::Run() {
             break;
         }
         const std::uint64_t now = platform_.MonotonicMilliseconds();
-        if (now - waitStarted >= options_.targetWaitTimeoutMs) {
+        if (!options_.infiniteWait &&
+            now - waitStarted >= options_.targetWaitTimeoutMs) {
             return Finish(SessionResult::TargetWaitTimedOutNoWrite);
         }
         platform_.SleepFor(options_.targetPollMs);

@@ -43,5 +43,8 @@ private:
 bool RepairNetworkAndMods(Logger& logger, bool resetModCache,
                           bool elevateNetworkOptimization,
                           std::wstring& summary);
+bool IsGameProcessRunning();
+bool IsAutoStartDaemonEnabled();
+bool SetAutoStartDaemonEnabled(bool enable, Logger& logger);
 
 }  // namespace civ6fix

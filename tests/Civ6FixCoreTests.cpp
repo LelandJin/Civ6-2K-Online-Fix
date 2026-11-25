@@ -377,6 +377,7 @@ void TestDetailedDiagnostics(TestRunner& tests) {
                      observation.discoveryState == 4 && observation.ssoState == 4 && !CompleteSample(observation),
                  "read-only observations never read or invent an installed guard counter");
     {
+        using namespace civ6fix;
         std::vector<std::string> order;
         ListenerOrderPlatform platform(order);
         platform.installOutcome = GuardInstallOutcome::Installed;
@@ -451,6 +452,7 @@ void TestDetailedDiagnostics(TestRunner& tests) {
     }
     tests.Expect(privacySafe, "every result branch excludes raw detail profile strings path PID address and secrets");
     {
+        using namespace civ6fix;
         std::vector<std::string> order;
         ListenerOrderPlatform platform(order);
         platform.installOutcome = GuardInstallOutcome::Installed;
@@ -1295,6 +1297,55 @@ int main() {
     tests.Expect(!alreadyEnabledChanged &&
                      unchangedOptions == "AutoModDownload 1\r\n",
                  "UserOptions helper is idempotent when AutoModDownload is already enabled");
+
+    {
+        using namespace civ6fix;
+        std::vector<std::string> order;
+        ListenerOrderPlatform infinitePlatform(order);
+        infinitePlatform.installOutcome = GuardInstallOutcome::Installed;
+        infinitePlatform.targetRunState = TargetRunState::Running;
+        infinitePlatform.monitorSample = {true, 1, 4, 4};
+
+        class DelayedScanPlatform final : public IFixSessionPlatform {
+        public:
+            explicit DelayedScanPlatform(ListenerOrderPlatform& inner) : inner_(inner) {}
+            PreparationResult Prepare() override { return inner_.Prepare(); }
+            bool LaunchViaSteam(std::wstring& d) override { return inner_.LaunchViaSteam(d); }
+            TargetScanResult ScanForTarget() override {
+                if (++scanCalls < 5) {
+                    return {TargetScanOutcome::NotFound, {}, 0};
+                }
+                return inner_.ScanForTarget();
+            }
+            RuntimeValidationResult ValidateRuntime(const TargetProcess& t, const BuildProfile& p) override {
+                return inner_.ValidateRuntime(t, p);
+            }
+            GuardInstallResult InstallGuard(const TargetProcess& t, const BuildProfile& p) override {
+                return inner_.InstallGuard(t, p);
+            }
+            TargetRunState QueryTargetState(const TargetProcess& t) override { return inner_.QueryTargetState(t); }
+            MonitorSample ReadMonitorSample(const TargetProcess& t, const InstalledGuard& g) override {
+                return inner_.ReadMonitorSample(t, g);
+            }
+            HookCleanupOutcome RestoreOwnedHook(const TargetProcess& t, const InstalledGuard& g) override {
+                return inner_.RestoreOwnedHook(t, g);
+            }
+            std::uint64_t MonotonicMilliseconds() override { return inner_.MonotonicMilliseconds(); }
+            void SleepFor(std::uint32_t ms) override { inner_.SleepFor(ms); }
+            int scanCalls = 0;
+        private:
+            ListenerOrderPlatform& inner_;
+        } delayed(infinitePlatform);
+
+        SilentObserver observer;
+        SessionOptions opts;
+        opts.infiniteWait = true;
+        opts.targetWaitTimeoutMs = 1;
+        opts.targetPollMs = 1;
+        FixSession session(delayed, observer, opts);
+        tests.Expect(session.Run() == SessionResult::Fixed && delayed.scanCalls == 5,
+                     "infiniteWait guardian continues waiting past targetWaitTimeoutMs and fixes late launches");
+    }
 
     return tests.Finish();
 }

@@ -83,6 +83,10 @@ struct CommandLineOptions {
     bool selfTest = false;
     bool diagnose = false;
     bool repairNetMods = false;
+    bool daemon = false;
+    bool installAutostart = false;
+    bool uninstallAutostart = false;
+    bool stopDaemon = false;
     bool observeCandidate = false;
     bool watchOnly = false;
     bool autoLaunchSteam = false;
@@ -111,6 +115,14 @@ CommandLineOptions ParseCommandLine() {
             options.diagnose = true;
         } else if (argument == L"--repair-net-mods") {
             options.repairNetMods = true;
+        } else if (argument == L"--daemon") {
+            options.daemon = true;
+        } else if (argument == L"--install-autostart") {
+            options.installAutostart = true;
+        } else if (argument == L"--uninstall-autostart") {
+            options.uninstallAutostart = true;
+        } else if (argument == L"--stop") {
+            options.stopDaemon = true;
         } else if (argument == L"--observe-candidate") {
             options.observeCandidate = true;
         } else if (argument == L"--watch-only") {
@@ -136,14 +148,20 @@ CommandLineOptions ParseCommandLine() {
     const int primaryModes = static_cast<int>(options.selfTest) +
                              static_cast<int>(options.diagnose) +
                              static_cast<int>(options.repairNetMods) +
+                             static_cast<int>(options.installAutostart) +
+                             static_cast<int>(options.uninstallAutostart) +
+                             static_cast<int>(options.stopDaemon) +
                              static_cast<int>(options.help) +
                              static_cast<int>(options.version) + static_cast<int>(options.profiles) +
                              static_cast<int>(options.observeCandidate);
     if (primaryModes > 1 ||
-        ((options.selfTest || options.diagnose || options.repairNetMods || options.help ||
+        ((options.selfTest || options.diagnose || options.repairNetMods ||
+          options.installAutostart || options.uninstallAutostart ||
+          options.stopDaemon || options.help ||
           options.version || options.profiles || options.observeCandidate) &&
-         (options.watchOnly || options.autoLaunchSteam || options.noGui)) ||
-        (options.watchOnly && options.autoLaunchSteam)) {
+         (options.watchOnly || options.autoLaunchSteam || options.noGui || options.daemon)) ||
+        (options.watchOnly && options.autoLaunchSteam) ||
+        (options.daemon && (options.noGui || options.autoLaunchSteam))) {
         options.valid = false;
         options.invalidArgument = L"互斥的运行模式";
     }
@@ -156,8 +174,12 @@ void PrintHelp() {
     ConsoleLine(L"  无参数              打开 GUI，只监听；推荐在 Steam 手动选择 DX11/DX12");
     ConsoleLine(L"  --watch-only        只监听，由用户自行启动 Steam（默认行为）");
     ConsoleLine(L"  --auto-launch-steam 显式请求 Steam 默认启动项；不保证渲染器");
-    ConsoleLine(L"  --no-gui            无窗口运行（可与上述启动模式组合）");
-    ConsoleLine(L"  --repair-net-mods   一键清理 hosts 死链、修复失效 DoH/虚拟网卡 DNS、代理白名单与重置模组缓存");
+    ConsoleLine(L"  --no-gui              无窗口运行（可与上述启动模式组合）");
+    ConsoleLine(L"  --daemon              后台常驻守护（隐藏启动，自动循环守护每次启动的游戏）");
+    ConsoleLine(L"  --install-autostart   写入开机自启常驻守护（HKCU Run -> --daemon）");
+    ConsoleLine(L"  --uninstall-autostart 移除开机常驻守护并停止后台实例");
+    ConsoleLine(L"  --stop                停止正在后台运行的守护实例");
+    ConsoleLine(L"  --repair-net-mods     一键清理 hosts 死链、修复失效 DoH/虚拟网卡 DNS、代理白名单与重置模组缓存");
     ConsoleLine(L"  --diagnose          只读检查 Steam 安装、进程和 Build Profile");
     ConsoleLine(L"  --observe-candidate 维护者：监听只读候选，输出服务状态变化，不启动游戏");
     ConsoleLine(L"  --self-test         纯离线核心自检，不枚举或打开游戏进程");
@@ -347,8 +369,63 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE previousInstance
         return 0;
     }
 
+    civ6fix::Logger logger;
+    logger.SetConsoleEcho(!commandLine.observeCandidate && !commandLine.daemon);
+    if (!logger.Open()) {
+        if (consoleMode) {
+            ConsoleLine(L"无法创建日志；为安全起见没有继续。");
+        } else if (!commandLine.daemon) {
+            MessageBoxW(nullptr, L"无法创建日志；为安全起见没有继续。",
+                        L"Civ6 2K Online Fix", MB_OK | MB_ICONERROR);
+        }
+        return 1;
+    }
+    logger.Event("application_started",
+                 "\"version\":\"" + std::string(civ6fix::kProductVersion) +
+                     "\",\"mode\":\"" +
+                     (commandLine.selfTest
+                          ? std::string("self_test")
+                          : (commandLine.diagnose
+                                 ? std::string("diagnose")
+                                 : (commandLine.daemon
+                                        ? std::string("daemon")
+                                        : (commandLine.noGui
+                                               ? std::string("headless")
+                                               : std::string("gui"))))) +
+                     "\"");
+
+    if (commandLine.selfTest) {
+        return RunOfflineSelfTest(logger);
+    }
+    if (commandLine.observeCandidate) return RunCandidateObservation(logger);
+    if (commandLine.diagnose) {
+        return RunDiagnosis(logger);
+    }
+    if (commandLine.stopDaemon) {
+        const bool ok = civ6fix::StopExistingAppInstance();
+        ConsoleLine(ok ? L"已停止后台常驻守护。" : L"未能完全停止现有实例。");
+        return ok ? 0 : 9;
+    }
+    if (commandLine.installAutostart) {
+        const bool ok = civ6fix::SetAutoStartDaemonEnabled(true, logger);
+        ConsoleLine(ok ? L"已启用开机后台常驻守护。" : L"写入开机启动项失败。");
+        return ok ? 0 : 9;
+    }
+    if (commandLine.uninstallAutostart) {
+        const bool regOk = civ6fix::SetAutoStartDaemonEnabled(false, logger);
+        const bool stopOk = civ6fix::StopExistingAppInstance();
+        ConsoleLine(L"已移除开机常驻守护并停止后台实例。");
+        return (regOk && stopOk) ? 0 : 9;
+    }
+    if (commandLine.repairNetMods) {
+        std::wstring summary;
+        const bool ok = civ6fix::RepairNetworkAndMods(logger, true, true, summary);
+        ConsoleLine(summary);
+        return ok ? 0 : 9;
+    }
+
     std::unique_ptr<ScopedHandle> instanceMutex;
-    if (!commandLine.selfTest && !commandLine.diagnose) {
+    {
         HANDLE mutex = CreateMutexW(nullptr, FALSE, kInstanceMutexName);
         if (mutex == nullptr) {
             ConsoleLine(L"无法建立单实例锁；为安全起见没有继续。");
@@ -357,6 +434,9 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE previousInstance
         const bool alreadyRunning = GetLastError() == ERROR_ALREADY_EXISTS;
         instanceMutex = std::make_unique<ScopedHandle>(mutex);
         if (alreadyRunning) {
+            if (commandLine.daemon) {
+                return 0;
+            }
             if (!commandLine.noGui && !commandLine.observeCandidate) {
                 for (int attempt = 0; attempt < 40; ++attempt) {
                     if (civ6fix::ActivateExistingAppWindow()) {
@@ -371,45 +451,9 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE previousInstance
         }
     }
 
-    civ6fix::Logger logger;
-    logger.SetConsoleEcho(!commandLine.observeCandidate);
-    if (!logger.Open()) {
-        if (consoleMode) {
-            ConsoleLine(L"无法创建日志；为安全起见没有继续。");
-        } else {
-            MessageBoxW(nullptr, L"无法创建日志；为安全起见没有继续。",
-                        L"Civ6 2K Online Fix", MB_OK | MB_ICONERROR);
-        }
-        return 1;
-    }
-    logger.Event("application_started",
-                 "\"version\":\"" + std::string(civ6fix::kProductVersion) +
-                     "\",\"mode\":\"" +
-                     (commandLine.selfTest
-                          ? std::string("self_test")
-                          : (commandLine.diagnose
-                                 ? std::string("diagnose")
-                                 : (commandLine.noGui
-                                        ? std::string("headless")
-                                        : std::string("gui")))) +
-                     "\"");
-
-    if (commandLine.selfTest) {
-        return RunOfflineSelfTest(logger);
-    }
-    if (commandLine.observeCandidate) return RunCandidateObservation(logger);
-    if (commandLine.diagnose) {
-        return RunDiagnosis(logger);
-    }
-    if (commandLine.repairNetMods) {
-        std::wstring summary;
-        const bool ok = civ6fix::RepairNetworkAndMods(logger, true, true, summary);
-        ConsoleLine(summary);
-        return ok ? 0 : 9;
-    }
     const bool autoLaunchSteam =
         commandLine.autoLaunchSteam ||
-        (!commandLine.watchOnly && ConfiguredAutoLaunchEnabled());
+        (!commandLine.watchOnly && !commandLine.daemon && ConfiguredAutoLaunchEnabled());
     if (commandLine.noGui) {
         return RunHeadless(logger, autoLaunchSteam);
     }
@@ -417,5 +461,9 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE previousInstance
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     civ6fix::SessionOptions options;
     options.launchViaSteam = autoLaunchSteam;
-    return civ6fix::RunAppWindow(instance, showCommand, logger, options);
+    options.infiniteWait = true;
+    options.residentGuardian = commandLine.daemon;
+    options.targetPollMs = commandLine.daemon ? 200U : 100U;
+    return civ6fix::RunAppWindow(
+        instance, commandLine.daemon ? SW_HIDE : showCommand, logger, options);
 }

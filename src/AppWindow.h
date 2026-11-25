@@ -16,6 +16,7 @@ inline constexpr wchar_t kAppWindowClassName[] =
     L"Civ6_2K_Online_Fix_v2_Window";
 
 bool ActivateExistingAppWindow();
+bool StopExistingAppInstance();
 int RunAppWindow(HINSTANCE instance, int showCommand, Logger& logger,
                  SessionOptions options);
 
