@@ -60,7 +60,7 @@ inline constexpr wchar_t kProductVersionWide[] =
 }  // namespace civ6fix
 #endif
 "@
-[System.IO.File]::WriteAllText($generatedIdentityHeader, $generatedIdentity, $utf8NoBom)
+[System.IO.File]::WriteAllText($generatedIdentityHeader, ($generatedIdentity.TrimEnd() + "`r`n"), $utf8NoBom)
 
 $manifestTemplatePath = Join-Path $sourceRoot 'Civ6_2K_Online_Fix.manifest.in'
 if (-not (Test-Path -LiteralPath $manifestTemplatePath -PathType Leaf)) {
@@ -73,7 +73,7 @@ if (($manifestTemplate.Split([string[]]@($manifestVersionPlaceholder), [StringSp
 }
 $generatedManifest = Join-Path $generatedRoot 'ProductManifest.generated.manifest'
 $manifestText = $manifestTemplate.Replace($manifestVersionPlaceholder, $windowsVersion)
-[System.IO.File]::WriteAllText($generatedManifest, $manifestText, $utf8NoBom)
+[System.IO.File]::WriteAllText($generatedManifest, ($manifestText.TrimEnd() + "`r`n"), $utf8NoBom)
 
 $visualStudioRoot = $null
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
